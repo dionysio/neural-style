@@ -3,7 +3,7 @@ require 'nn'
 require 'image'
 require 'optim'
 
-local loadcaffe_wrap = require 'loadcaffe_wrapper'
+require 'loadcaffe'
 
 --------------------------------------------------------------------------------
 
@@ -38,33 +38,47 @@ cmd:option('-style_scale', 1.0)
 cmd:option('-pooling', 'max', 'max|avg')
 cmd:option('-proto_file', 'models/VGG_ILSVRC_19_layers_deploy.prototxt')
 cmd:option('-model_file', 'models/VGG_ILSVRC_19_layers.caffemodel')
-cmd:option('-backend', 'nn', 'nn|cudnn')
+cmd:option('-backend', 'nn', 'nn|cudnn|clnn')
+cmd:option('-cudnn_autotune', false)
 cmd:option('-seed', -1)
 
 cmd:option('-content_layers', 'relu4_2', 'layers for content')
 cmd:option('-style_layers', 'relu1_1,relu2_1,relu3_1,relu4_1,relu5_1', 'layers for style')
 
-function nn.SpatialConvolutionMM:accGradParameters()
-  -- nop.  not needed by our net
-end
-
 local function main(params)
+  local lastTotalLoss = 0.0
+
   if params.gpu >= 0 then
-    require 'cutorch'
-    require 'cunn'
-    cutorch.setDevice(params.gpu + 1)
+    if params.backend ~= 'clnn' then
+      require 'cutorch'
+      require 'cunn'
+      cutorch.setDevice(params.gpu + 1)
+    else
+      require 'clnn'
+      require 'cltorch'
+      cltorch.setDevice(params.gpu + 1)
+    end
   else
-    params.backend = 'nn-cpu'
+    params.backend = 'nn'
   end
 
   if params.backend == 'cudnn' then
     require 'cudnn'
+    if params.cudnn_autotune then
+      cudnn.benchmark = true
+    end
     cudnn.SpatialConvolution.accGradParameters = nn.SpatialConvolutionMM.accGradParameters -- ie: nop
   end
   
-  local cnn = loadcaffe_wrap.load(params.proto_file, params.model_file, params.backend):float()
+  local loadcaffe_backend = params.backend
+  if params.backend == 'clnn' then loadcaffe_backend = 'nn' end
+  local cnn = loadcaffe.load(params.proto_file, params.model_file, loadcaffe_backend):float()
   if params.gpu >= 0 then
-    cnn:cuda()
+    if params.backend ~= 'clnn' then
+      cnn:cuda()
+    else
+      cnn:cl()
+    end
   end
   
   local content_image = image.load(params.content_image, 3)
@@ -106,9 +120,16 @@ local function main(params)
   
 
   if params.gpu >= 0 then
-    content_image_caffe = content_image_caffe:cuda()
-    for i = 1, #style_images_caffe do
-      style_images_caffe[i] = style_images_caffe[i]:cuda()
+    if params.backend ~= 'clnn' then
+      content_image_caffe = content_image_caffe:cuda()
+      for i = 1, #style_images_caffe do
+        style_images_caffe[i] = style_images_caffe[i]:cuda()
+      end
+    else
+      content_image_caffe = content_image_caffe:cl()
+      for i = 1, #style_images_caffe do
+        style_images_caffe[i] = style_images_caffe[i]:cl()
+      end
     end
   end
   
@@ -122,7 +143,11 @@ local function main(params)
   if params.tv_weight > 0 then
     local tv_mod = nn.TVLoss(params.tv_weight):float()
     if params.gpu >= 0 then
-      tv_mod:cuda()
+      if params.backend ~= 'clnn' then
+        tv_mod:cuda()
+      else
+        tv_mod:cl()
+      end
     end
     net:add(tv_mod)
   end
@@ -137,7 +162,13 @@ local function main(params)
         local kW, kH = layer.kW, layer.kH
         local dW, dH = layer.dW, layer.dH
         local avg_pool_layer = nn.SpatialAveragePooling(kW, kH, dW, dH):float()
-        if params.gpu >= 0 then avg_pool_layer:cuda() end
+        if params.gpu >= 0 then
+          if params.backend ~= 'clnn' then
+            avg_pool_layer:cuda()
+          else
+            avg_pool_layer:cl()
+          end
+        end
         local msg = 'Replacing max pooling at layer %d with average pooling'
         print(string.format(msg, i))
         net:add(avg_pool_layer)
@@ -150,7 +181,11 @@ local function main(params)
         local norm = params.normalize_gradients
         local loss_module = nn.ContentLoss(params.content_weight, target, norm):float()
         if params.gpu >= 0 then
-          loss_module:cuda()
+          if params.backend ~= 'clnn' then
+            loss_module:cuda()
+          else
+            loss_module:cl()
+          end
         end
         net:add(loss_module)
         table.insert(content_losses, loss_module)
@@ -160,7 +195,11 @@ local function main(params)
         print("Setting up style layer  ", i, ":", layer.name)
         local gram = GramMatrix():float()
         if params.gpu >= 0 then
-          gram = gram:cuda()
+          if params.backend ~= 'clnn' then
+            gram = gram:cuda()
+          else
+            gram = gram:cl()
+          end
         end
         local target = nil
         for i = 1, #style_images_caffe do
@@ -177,7 +216,11 @@ local function main(params)
         local norm = params.normalize_gradients
         local loss_module = nn.StyleLoss(params.style_weight, target, norm):float()
         if params.gpu >= 0 then
-          loss_module:cuda()
+          if params.backend ~= 'clnn' then
+            loss_module:cuda()
+          else
+            loss_module:cl()
+          end
         end
         net:add(loss_module)
         table.insert(style_losses, loss_module)
@@ -191,34 +234,43 @@ local function main(params)
   for i=1,#net.modules do
     local module = net.modules[i]
     if torch.type(module) == 'nn.SpatialConvolutionMM' then
-        -- remote these, not used, but uses gpu memory
+        -- remove these, not used, but uses gpu memory
         module.gradWeight = nil
         module.gradBias = nil
     end
   end
   collectgarbage()
   
-  -- Initialize the image
-  if params.seed >= 0 then
-    torch.manualSeed(params.seed)
+  local y
+  local dy
+
+  local function initImage(params)
+    -- Initialize the image
+    if params.seed >= 0 then
+      torch.manualSeed(params.seed)
+    end
+    local img = nil
+    if params.init == 'random' then
+      img = torch.randn(content_image:size()):float():mul(0.001)
+    elseif params.init == 'image' then
+      img = content_image_caffe:clone():float()
+    else
+      error('Invalid init type')
+    end
+    if params.gpu >= 0 then
+      img = img:cuda()
+    end
+
+    -- Run it through the network once to get the proper size for the gradient
+    -- All the gradients will come from the extra loss modules, so we just pass
+    -- zeros into the top of the net on the backward pass.
+    y = net:forward(img)
+    dy = img.new(#y):zero()
+
+    return img
   end
-  local img = nil
-  if params.init == 'random' then
-    img = torch.randn(content_image:size()):float():mul(0.001)
-  elseif params.init == 'image' then
-    img = content_image_caffe:clone():float()
-  else
-    error('Invalid init type')
-  end
-  if params.gpu >= 0 then
-    img = img:cuda()
-  end
-  
-  -- Run it through the network once to get the proper size for the gradient
-  -- All the gradients will come from the extra loss modules, so we just pass
-  -- zeros into the top of the net on the backward pass.
-  local y = net:forward(img)
-  local dy = img.new(#y):zero()
+
+  local img = initImage(params)
 
   -- Declaring this here lets us access it in maybe_print
   local optim_state = nil
@@ -272,7 +324,7 @@ local function main(params)
   local function feval(x)
     num_calls = num_calls + 1
     net:forward(x)
-    local grad = net:backward(x, dy)
+    local grad = net:updateGradInput(x, dy)
     local loss = 0
     for _, mod in ipairs(content_losses) do
       loss = loss + mod.loss
@@ -282,6 +334,16 @@ local function main(params)
     end
     maybe_print(num_calls, loss)
     maybe_save(num_calls)
+
+    if (lastTotalLoss - loss) == 0.0 then
+        print('********** 0 total loss from last iteration; re-seeding **********')
+        -- need to reinitialize image with new noise seed
+        initImage(params)
+        lastTotalLoss = 0
+        collectgarbage()
+        return 0, grad:view(grad:nElement())
+    end
+    lastTotalLoss = loss
 
     collectgarbage()
     -- optim.lbfgs expects a vector for gradients
@@ -304,7 +366,8 @@ end
 function build_filename(output_image, iteration)
   local ext = paths.extname(output_image)
   local basename = paths.basename(output_image, ext)
-  return string.format('%s_%d.%s', basename, iteration, ext)
+  local directory = paths.dirname(output_image)
+  return string.format('%s/%s_%d.%s',directory, basename, iteration, ext)
 end
 
 
@@ -451,4 +514,5 @@ end
 
 
 local params = cmd:parse(arg)
+print(params)
 main(params)
